@@ -5,22 +5,7 @@ import logging
 import datetime
 from typing import Dict, List, Optional, Tuple
 from pypushdeer import PushDeer
-import socket
-import time
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# ==================== 关键修复部分 ====================
-def force_ipv4():
-    """GitHub Actions 上强制使用 IPv4，解决 api2.pushdeer.com 的 IPv6 路由超时"""
-    old_getaddrinfo = socket.getaddrinfo
-    def new_getaddrinfo(*args, **kwargs):
-        return [r for r in old_getaddrinfo(*args, **kwargs) if r[0] == socket.AF_INET]
-    socket.getaddrinfo = new_getaddrinfo
-
-# 只在推送前执行一次（放在 if 外面也行）
-force_ipv4()
-# ===================================================
 
 def beijing_time_converter(timestamp):
     utc_dt = datetime.datetime.fromtimestamp(timestamp, tz=datetime.timezone.utc)
@@ -276,39 +261,12 @@ def main():
     if not push_key:
         logger.info(f"未设置 '{ENV_PUSH_KEY}'，跳过推送通知。")
     else:
-        # 改用 api.pushdeer.com（api2 更容易被 GitHub IP 限流）
-        url = "https://api.pushdeer.com/message/push"
-        params = {
-            "pushkey": push_key,
-            "text": title,
-            "desp": content,
-             "type": "text"
-        }
-    
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                # 带重试 + 超时 + 连接池的 Session
-                session = requests.Session()
-                retries = Retry(
-                    total=5,
-                    backoff_factor=1,
-                    status_forcelist=[429, 500, 502, 503, 504]
-                )
-                session.mount("https://", HTTPAdapter(max_retries=retries))
-            
-                r = session.get(url, params=params, timeout=30)  # 30秒超时
-                r.raise_for_status()
-            
-                logger.info("推送通知发送成功。")
-                break
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    logger.error(f"发送推送通知失败（已重试 {max_retries} 次）: {e}")
-                else:
-                    wait = 2 ** attempt   # 1→2→4→8→16 秒指数退避
-                    logger.warning(f"推送失败（第 {attempt+1} 次），{wait} 秒后重试: {e}")
-                    time.sleep(wait)
+        try:
+            pushdeer = PushDeer(pushkey=push_key)
+            pushdeer.send_text(title, desp=content)
+            logger.info("推送通知发送成功。")
+        except Exception as e:
+            logger.error(f"发送推送通知失败: {e}")
 
 		
 if __name__ == '__main__':
