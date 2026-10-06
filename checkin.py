@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 
 # ENVIRONMENT
 ENV_PUSH_KEY = "PUSHDEER_SENDKEY"
+ENV_SERVERCHAN_KEY = "SERVERCHAN_SENDKEY"
+ENV_PUSH_PROVIDER = "GLADOS_PUSH_PROVIDER"
 ENV_COOKIES = "GLADOS_COOKIES"
 ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
 ENV_USER_AGENT = "GLADOS_USER_AGENT"
@@ -52,12 +54,16 @@ HEADERS_TEMPLATE = {
 EXCHANGE_POINTS = {"plan100": 100, "plan200": 200, "plan500": 500}
 
 def load_config() -> Tuple[str, List[str], str]:
-    push_key_env = os.environ.get(ENV_PUSH_KEY)
+    provider = os.environ.get(ENV_PUSH_PROVIDER, 'serverchan3').strip().lower()
+    if provider not in ('serverchan3', 'pushdeer'):
+        raise ValueError('不支持的推送渠道。')
+    key_name = ENV_SERVERCHAN_KEY if provider == 'serverchan3' else ENV_PUSH_KEY
+    push_key_env = os.environ.get(key_name, '').strip()
     raw_cookies_env = os.environ.get(ENV_COOKIES)
     exchange_plan_env = os.environ.get(ENV_EXCHANGE_PLAN)
 
     if not push_key_env:
-        logger.warning(f"环境变量 '{ENV_PUSH_KEY}' 未设置。")
+        logger.warning(f"环境变量 '{key_name}' 未设置，本次仅记录签到结果，不发送手机通知。")
         push_key = ''
     else:
         push_key = push_key_env
@@ -83,7 +89,7 @@ def load_config() -> Tuple[str, List[str], str]:
 
 
     logger.info(f"共加载了 {len(cookies_list)} 个 Cookie 用于签到。")
-    logger.info(f"当前 {ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}。")
+    logger.info('当前推送渠道: %s；%s %s。', provider, key_name, '已设置' if push_key_env else '未设置')
     logger.info(f"当前 {ENV_EXCHANGE_PLAN}: {exchange_plan}。")
 
     return push_key, cookies_list, exchange_plan
@@ -287,6 +293,41 @@ def format_push_content(results: List[Dict[str, str]]) -> Tuple[str, str]:
     return title, content
 
 
+def send_notification(push_key: str, title: str, content: str) -> bool:
+    provider = os.environ.get(ENV_PUSH_PROVIDER, 'serverchan3').strip().lower()
+    try:
+        if provider == 'pushdeer':
+            accepted = PushDeer(pushkey=push_key).send_text(title, desp=content) is True
+        elif provider == 'serverchan3':
+            match = re.fullmatch(r'sctp([0-9]+)t[A-Za-z0-9_-]+', push_key)
+            if match is None:
+                logger.error('SERVERCHAN_SENDKEY 格式无效，请使用 Server酱³ 的新 SendKey。')
+                return False
+            # 官方 SC3 接口：从 sctp<uid>t 前缀取得用户编号。
+            # URL 中含凭据，禁止记录 URL、原始响应或异常文本。
+            url = f'https://{match.group(1)}.push.ft07.com/send/{push_key}.send'
+            response = requests.post(
+                url, json={'title': title, 'desp': content},
+                timeout=REQUEST_TIMEOUT, allow_redirects=False
+            )
+            if not 200 <= response.status_code < 300:
+                logger.error('Server酱³ 推送请求失败，HTTP %s。', response.status_code)
+                return False
+            payload = response.json()
+            accepted = isinstance(payload, dict) and type(payload.get('code')) is int and payload['code'] == 0
+        else:
+            logger.error('不支持的推送渠道。')
+            return False
+        if accepted:
+            logger.info('推送服务端已接受消息 (%s)；手机是否收到需在 App 中确认。', provider)
+        else:
+            logger.error('推送服务端未确认成功 (%s)，请检查 Key、账户和服务状态。', provider)
+        return accepted
+    except Exception as e:
+        logger.error('发送推送通知失败 (%s)。', type(e).__name__)
+        return False
+
+
 def main():
     push_key = ''
     exit_code = 0
@@ -321,14 +362,9 @@ def main():
         exit_code = 1
 
     if not push_key:
-        logger.info(f"未设置 '{ENV_PUSH_KEY}'，跳过推送通知。")
+        logger.warning('推送 Key 未配置，跳过手机通知；签到结果已记录在日志中。')
     else:
-        try:
-            pushdeer = PushDeer(pushkey=push_key)
-            pushdeer.send_text(title, desp=content)
-            logger.info("推送通知发送成功。")
-        except Exception as e:
-            logger.error('发送推送通知失败 (%s)。', type(e).__name__)
+        if not send_notification(push_key, title, content):
             exit_code = 1
     return exit_code
 

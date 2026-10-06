@@ -46,7 +46,18 @@
 
 4. 手机推送（非必须）
 
-- 添加1个`repository secret`，命名为`PUSHDEER_SENDKEY`，其值对应 PushDeer key: ([获取地址](https://www.pushdeer.com/product.html))。
+- 默认使用 **Server酱³ 安卓/iOS App** 接收通知：
+  1. 在手机打开 [官方下载页](https://sc3.ft07.com/client) 安装 App。
+  2. 在 [SendKey 页面](https://sc3.ft07.com/sendkey) 登录并获取新 SendKey，按 App 提示绑定同一个 Key。
+  3. 在 GitHub `Settings → Secrets and variables → Actions` 新增 Secret `SERVERCHAN_SENDKEY`，值填完整的新 SendKey（格式为 `sctp<数字>t<令牌>`）。不要把真实 Key 提交到仓库或发送到聊天。
+  4. 允许 App 通知；若手机不支持官网列出的厂商通道，按官网说明维持 App 后台运行。
+  5. 在 Actions 手动运行一次，并同时核对手机 App 消息列表与通知提醒。
+
+Server酱³ 与 Server酱Turbo 的账号、Key 不通用；旧 `SENDKEY` 不会自动复用。费用与额度请以官网和账号页面为准，签到摘要不调用 AI 功能。
+
+未配置 `SERVERCHAN_SENDKEY` 时，签到仍运行，日志明确提示跳过手机通知；配置后，HTTP 错误、API 拒绝或解析错误都会让工作流失败。服务端接受消息不等于手机已经收到，最终以 App 为准。
+
+需要保留 PushDeer 的其他用户，可设置 Repository Variable `GLADOS_PUSH_PROVIDER=pushdeer`，并配置 Secret `PUSHDEER_SENDKEY`。官方 Android PushDeer 已停用，安卓用户应使用默认的 Server酱³。来源：[PushDeer 官方说明](https://github.com/easychen/pushdeer)、[Server酱³ 官方 FAQ](https://sc3.ft07.com/doc)。
 
 ### **star**自己的仓库
 
@@ -65,6 +76,7 @@
 ## 更新日志
 
 - **2026-10**：适配新版 `gld:sess` 签名会话、可配置的 User-Agent 和新版签到结果；认证失败立即停止该账户的后续请求；查询失败不再当作零积分；失败返回非零退出码；请求增加超时并避免输出原始响应或异常中的敏感信息。
+- **2026-10**：手机通知默认切换到 Server酱³ App；校验服务端返回值；PushDeer 返回 `False` 时不再误报成功；新推送请求有超时且不自动重试。
 - **2026-01**: 重构代码，添加log输出方便定位，支持新版网址，支持配置积分兑换策略。
 
 ## “没有权限”排查
