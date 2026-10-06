@@ -3,7 +3,7 @@ name: auto check
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ master ]
     paths-ignore:
       - 'README.md'
       - 'imgs/'
@@ -35,6 +35,9 @@ jobs:
         pip install requests
         pip install pypushdeer
 
+    - name: test response handling
+      run: python -m unittest discover -s tests -v
+
     # 执行 签到脚本
     - name: running checkin
       run: |
@@ -44,8 +47,10 @@ jobs:
         PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
+        GLADOS_USER_AGENT: ${{ secrets.GLADOS_USER_AGENT || vars.GLADOS_USER_AGENT }}
 
     - name: keep alive
+      if: ${{ !cancelled() }}
       uses: liskin/gh-workflow-keepalive@v1 # using the workflow with default settings
       
     - name: delete workflow runs
