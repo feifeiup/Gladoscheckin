@@ -176,6 +176,11 @@ class TransportTests(unittest.TestCase):
 
 
 class MainTests(unittest.TestCase):
+    def setUp(self):
+        environment = patch.dict(os.environ, {'GLADOS_PUSH_PROVIDER': 'pushdeer'}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def test_failure_not_hidden_by_successful_push_and_other_account_continues(self):
         results = [
             ('签到失败: 认证失败', '0', '未知', '未知', '未兑换（认证未通过）'),
@@ -184,6 +189,7 @@ class MainTests(unittest.TestCase):
         with patch.object(checkin, 'load_config', return_value=('test-key', [COOKIE, COOKIE], 'plan500')):
             with patch.object(checkin, 'checkin_and_process', side_effect=results) as account:
                 with patch.object(checkin, 'PushDeer') as push:
+                    push.return_value.send_text.return_value = True
                     self.assertEqual(checkin.main(), 1)
         self.assertEqual(account.call_count, 2)
         push.return_value.send_text.assert_called_once()
@@ -209,6 +215,89 @@ class MainTests(unittest.TestCase):
                 '签到成功，获得 12 积分', '12', '10 天', '获取剩余积分失败', '未兑换（积分查询失败，余额未知）'
             )):
                 self.assertEqual(checkin.main(), 1)
+
+    def test_rejected_push_fails_even_when_checkin_succeeded(self):
+        with patch.object(checkin, 'load_config', return_value=('fake-key', [COOKIE], 'plan500')):
+            with patch.object(checkin, 'checkin_and_process', return_value=(
+                '签到成功', '6', '388 天', '439 积分', '积分不足，未兑换'
+            )):
+                with patch.object(checkin, 'PushDeer') as push:
+                    push.return_value.send_text.return_value = False
+                    with self.assertLogs(checkin.logger, level='ERROR') as logs:
+                        self.assertEqual(checkin.main(), 1)
+        self.assertNotIn('发送成功', '\n'.join(logs.output))
+
+
+class NotificationTests(unittest.TestCase):
+    KEY = 'sctp123tFakeTestToken'
+
+    def setUp(self):
+        environment = patch.dict(os.environ, {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_configuration_uses_only_serverchan_key_by_default(self):
+        with patch.dict(os.environ, {
+            'SERVERCHAN_SENDKEY': self.KEY, 'SENDKEY': 'old-token',
+            'PUSHDEER_SENDKEY': 'old-pushdeer', 'GLADOS_COOKIES': COOKIE
+        }):
+            key, cookies, plan = checkin.load_config()
+        self.assertEqual(key, self.KEY)
+        self.assertEqual(cookies, [COOKIE])
+        self.assertEqual(plan, 'plan500')
+
+    def test_missing_serverchan_key_does_not_fallback_to_other_service(self):
+        with patch.dict(os.environ, {'PUSHDEER_SENDKEY': 'old-token', 'GLADOS_COOKIES': COOKIE}):
+            key, _, _ = checkin.load_config()
+        self.assertEqual(key, '')
+
+    def test_serverchan_acceptance_url_body_and_timeout(self):
+        with patch.object(checkin.requests, 'post', return_value=response({'code': 0})) as post:
+            with patch.object(checkin, 'PushDeer') as old:
+                self.assertTrue(checkin.send_notification(self.KEY, '签到', '测试摘要'))
+        self.assertEqual(post.call_args.args[0], 'https://123.push.ft07.com/send/' + self.KEY + '.send')
+        self.assertEqual(post.call_args.kwargs['json'], {'title': '签到', 'desp': '测试摘要'})
+        self.assertEqual(post.call_args.kwargs['timeout'], checkin.REQUEST_TIMEOUT)
+        self.assertFalse(post.call_args.kwargs['allow_redirects'])
+        old.assert_not_called()
+
+    def test_api_rejections_do_not_claim_success_or_leak_body(self):
+        for payload in ({'code': 1, 'message': self.KEY}, {'code': False}, {'code': '0'}, {}, [], None):
+            with self.subTest(payload=payload):
+                with patch.object(checkin.requests, 'post', return_value=response(payload)):
+                    with self.assertLogs(checkin.logger, level='ERROR') as logs:
+                        self.assertFalse(checkin.send_notification(self.KEY, '标题', '内容'))
+                self.assertNotIn(self.KEY, '\n'.join(logs.output))
+                self.assertNotIn('已接受', '\n'.join(logs.output))
+
+    def test_http_error_json_error_and_timeout_are_bounded_failures(self):
+        bad_http = response({'code': 0, 'private': self.KEY})
+        bad_http.status_code = 403
+        bad_json = response({'code': 0})
+        bad_json._content = self.KEY.encode('utf-8')
+        for item in (bad_http, bad_json, requests.Timeout(self.KEY)):
+            kwargs = {'side_effect': item} if isinstance(item, Exception) else {'return_value': item}
+            with self.subTest(item=type(item).__name__):
+                with patch.object(checkin.requests, 'post', **kwargs) as post:
+                    with self.assertLogs(checkin.logger, level='ERROR') as logs:
+                        self.assertFalse(checkin.send_notification(self.KEY, '标题', '内容'))
+                self.assertEqual(post.call_count, 1)
+                self.assertNotIn(self.KEY, '\n'.join(logs.output))
+
+    def test_invalid_key_never_makes_network_request(self):
+        for key in ('SCToldkey', 'sctp123', 'sctp123tbad/route', 'sctp123tbad?query', ''):
+            with self.subTest(key=key):
+                with patch.object(checkin.requests, 'post') as post:
+                    self.assertFalse(checkin.send_notification(key, '标题', '内容'))
+                post.assert_not_called()
+
+    def test_legacy_pushdeer_false_is_failure(self):
+        with patch.dict(os.environ, {'GLADOS_PUSH_PROVIDER': 'pushdeer'}):
+            with patch.object(checkin, 'PushDeer') as push:
+                push.return_value.send_text.return_value = False
+                with self.assertLogs(checkin.logger, level='ERROR') as logs:
+                    self.assertFalse(checkin.send_notification('fake-key', '标题', '内容'))
+        self.assertNotIn('已接受', '\n'.join(logs.output))
 
 
 if __name__ == '__main__':
