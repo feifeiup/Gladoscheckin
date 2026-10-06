@@ -45,6 +45,8 @@ jobs:
       env:
         # env获取
         PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
+        SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+        GLADOS_PUSH_PROVIDER: ${{ vars.GLADOS_PUSH_PROVIDER || 'serverchan3' }}
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_USER_AGENT: ${{ secrets.GLADOS_USER_AGENT || vars.GLADOS_USER_AGENT }}
