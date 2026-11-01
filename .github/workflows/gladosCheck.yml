@@ -15,16 +15,17 @@ on:
 jobs:
   build:
     name: glados checkin
-    runs-on: ubuntu-latest
+    # 固定系统版本，避免 ubuntu-latest 升级导致 Python 安装中断。
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
-        python-version: [3.8]
+        python-version: ['3.12']
 
     steps:
     - uses: actions/checkout@v4
 
     - name: set up python ${{ matrix.python-version }}
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v7
       with:
         python-version: ${{ matrix.python-version }}
 
