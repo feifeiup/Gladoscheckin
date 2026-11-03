@@ -4,6 +4,8 @@ import logging
 import datetime
 import math
 import re
+from email.utils import parsedate_to_datetime
+from http.cookies import CookieError, SimpleCookie
 from typing import Dict, List, Optional, Tuple
 from pypushdeer import PushDeer
 
@@ -52,6 +54,12 @@ HEADERS_TEMPLATE = {
 
 # Exchange Plan Points
 EXCHANGE_POINTS = {"plan100": 100, "plan200": 200, "plan500": 500}
+
+SESSION_COOKIE_NAMES = ('gld:sess', 'gld:sess.sig')
+COOKIE_DIAGNOSTIC_LABELS = {
+    CHECKIN_URL: '签到', STATUS_URL: '状态',
+    POINTS_URL: '积分', EXCHANGE_URL: '兑换',
+}
 
 def load_config() -> Tuple[str, List[str], str]:
     provider = os.environ.get(ENV_PUSH_PROVIDER, 'serverchan3').strip().lower()
@@ -158,6 +166,80 @@ def numeric_value(value) -> Optional[int]:
         return None
 
 
+def log_session_cookie_diagnostics(response: requests.Response, sent_cookie: str, label: str) -> None:
+    """Observe existing responses only; never log or persist Cookie values/headers."""
+    try:
+        # Preserve separate Set-Cookie headers (Expires itself contains a comma).
+        raw_headers = getattr(response.raw, 'headers', None)
+        if raw_headers is not None and hasattr(raw_headers, 'getlist'):
+            cookie_headers = raw_headers.getlist('Set-Cookie')
+        elif response.headers.get('Set-Cookie') is not None:
+            logger.info('Cookie检测[%s]: 无法读取独立 Set-Cookie 头，换发情况未知。', label)
+            return
+        else:
+            cookie_headers = []
+
+        sent_values = dict(part.strip().split('=', 1) for part in sent_cookie.split(';') if '=' in part)
+        observed = {name: [] for name in SESSION_COOKIE_NAMES}
+        parse_complete = True
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for header in cookie_headers:
+            parsed = SimpleCookie()
+            try:
+                parsed.load(header)
+            except CookieError:
+                parse_complete = False
+                continue
+            if not parsed:
+                parse_complete = False
+            for name in SESSION_COOKIE_NAMES:
+                if name not in parsed:
+                    continue
+                morsel = parsed[name]
+                max_age = None
+                max_age_label = '未提供'
+                if morsel['max-age']:
+                    if re.fullmatch(r'-?[0-9]{1,10}', morsel['max-age']):
+                        max_age = int(morsel['max-age'])
+                        max_age_label = str(max_age)
+                    else:
+                        max_age_label = '无效'
+                expires = None
+                expires_label = '未提供'
+                if morsel['expires']:
+                    try:
+                        expires = parsedate_to_datetime(morsel['expires'])
+                        if expires.tzinfo is None:
+                            expires = expires.replace(tzinfo=datetime.timezone.utc)
+                        expires = expires.astimezone(datetime.timezone.utc)
+                        expires_label = expires.strftime('%Y-%m-%dT%H:%M:%SZ')
+                    except (ValueError, TypeError, OverflowError):
+                        expires_label = '无效'
+                # Max-Age takes precedence over Expires when valid.
+                deleted = (max_age <= 0 if max_age is not None
+                           else expires is not None and expires <= now)
+                if deleted or not morsel.value:
+                    action = '清除或空值'
+                elif name not in sent_values:
+                    action = '新增'
+                else:
+                    action = '值变化' if morsel.value != sent_values[name] else '值未变化'
+                observed[name].append((action, max_age_label, expires_label))
+
+        logger.info('Cookie检测[%s]: HTTP %s；Set-Cookie=%s；解析=%s。',
+                    label, response.status_code, '有' if cookie_headers else '无',
+                    '完整' if parse_complete else '不完整（未观察到不代表未换发）')
+        for name in SESSION_COOKIE_NAMES:
+            if not observed[name]:
+                logger.info('Cookie检测[%s]: %s 未观察到下发。', label, name)
+            for action, max_age_label, expires_label in observed[name]:
+                logger.info('Cookie检测[%s]: %s；动作=%s；Max-Age秒=%s；ExpiresUTC=%s。',
+                            label, name, action, max_age_label, expires_label)
+    except Exception:
+        # Diagnostics must not change account handling or expose exception text.
+        logger.warning('Cookie检测[%s]: 检测失败，换发情况未知；继续原有请求处理。', label)
+
+
 def make_request(url: str, method: str, headers: Dict[str, str], data: Optional[Dict] = None, cookies: str = "") -> Optional[requests.Response]:
 
     session_headers = headers.copy()
@@ -172,6 +254,8 @@ def make_request(url: str, method: str, headers: Dict[str, str], data: Optional[
             logger.error(f"不支持的 HTTP 方法: {method}")
             return None
 
+        if url in COOKIE_DIAGNOSTIC_LABELS:
+            log_session_cookie_diagnostics(response, cookies, COOKIE_DIAGNOSTIC_LABELS[url])
         if not 200 <= response.status_code < 300:
             logger.warning(f"向 {url} 发起的请求失败，状态码 {response.status_code}。")
             if response.status_code in (401, 403):
