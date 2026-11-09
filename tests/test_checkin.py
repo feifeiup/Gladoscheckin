@@ -10,6 +10,7 @@ import checkin
 
 COOKIE = 'gld:sess=test-session; gld:sess.sig=test-signature; other=value'
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0'
+CHALLENGE = {'code': 0, 'nonce': 'test-challenge', 'ttl': 300_000}
 
 
 def response(payload):
@@ -24,10 +25,11 @@ class AccountTests(unittest.TestCase):
         self.environment = patch.dict(os.environ, {'GLADOS_USER_AGENT': UA}, clear=True)
         self.environment.start()
         self.addCleanup(self.environment.stop)
+        self.sleep = self.enterContext(patch.object(checkin.time, 'sleep'))
 
-    def run_account(self, payloads):
+    def run_account(self, payloads, *, challenge=CHALLENGE):
         with patch.object(checkin, 'make_request', side_effect=[
-            response(value) if value is not None else None for value in payloads
+            response(value) if value is not None else None for value in [challenge, *payloads]
         ]) as request:
             result = checkin.checkin_and_process(COOKIE, 'plan500')
         return result, request
@@ -38,6 +40,55 @@ class AccountTests(unittest.TestCase):
         self.assertIn('gld:sess', result[0])
         self.assertIn('失败', result[0])
         request.assert_not_called()
+
+    def test_valid_challenge_is_used_for_one_checkin_post(self):
+        result, request = self.run_account([
+            {'code': 0, 'points': 12}, {'data': {'leftDays': 10}}, {'points': 200},
+        ])
+        self.assertEqual(result[1:4], ('12', '10 天', '200 积分'))
+        self.sleep.assert_called_once_with(2.7)
+        calls = request.call_args_list
+        self.assertEqual([call.args[:2] for call in calls], [
+            (checkin.CHECKIN_CHALLENGE_URL, 'GET'), (checkin.CHECKIN_URL, 'POST'),
+            (checkin.STATUS_URL, 'GET'), (checkin.POINTS_URL, 'GET'),
+        ])
+        self.assertEqual(calls[1].args[3], {
+            'token': 'glados.cloud', 'nonce': 'test-challenge',
+            'proof': 'b96970356b316a7b8cbf726351f3dfb7362d9faae20ad1ec47035ef36ddb5c87',
+        })
+        self.assertEqual(calls[0].args[2], calls[1].args[2])
+        self.assertEqual(calls[0].kwargs['cookies'], calls[1].kwargs['cookies'])
+
+    def test_challenge_auth_rejection_stops_before_checkin(self):
+        result, request = self.run_account([], challenge={'code': -2, 'message': '没有权限'})
+        self.assertIn('认证失败', result[0])
+        self.assertEqual(request.call_args.args[:2], (checkin.CHECKIN_CHALLENGE_URL, 'GET'))
+        request.assert_called_once()
+        self.sleep.assert_not_called()
+
+    def test_invalid_challenge_stops_before_checkin(self):
+        for challenge in (None, [], {'code': 0}, {**CHALLENGE, 'nonce': '\ud800'},
+                          {**CHALLENGE, 'ttl': 2700}, {**CHALLENGE, 'ttl': '300000'}):
+            with self.subTest(challenge=challenge):
+                result, request = self.run_account([], challenge=challenge)
+                self.assertIn('签到失败', result[0])
+                self.assertEqual(request.call_args.args[:2], (checkin.CHECKIN_CHALLENGE_URL, 'GET'))
+                request.assert_called_once()
+        self.sleep.assert_not_called()
+
+    def test_challenge_expiring_while_waiting_is_not_submitted(self):
+        with patch.object(checkin.time, 'monotonic', side_effect=[10, 13]):
+            result, request = self.run_account([], challenge={**CHALLENGE, 'ttl': 3000})
+        self.assertIn('签到校验已过期', result[0])
+        request.assert_called_once()
+        self.sleep.assert_called_once_with(2.7)
+
+    def test_failed_checkin_post_is_never_retried(self):
+        result, request = self.run_account([None])
+        self.assertIn('签到失败', result[0])
+        self.assertEqual([call.args[:2] for call in request.call_args_list], [
+            (checkin.CHECKIN_CHALLENGE_URL, 'GET'), (checkin.CHECKIN_URL, 'POST'),
+        ])
 
     def test_missing_signature_stops_before_network(self):
         with patch.object(checkin, 'make_request') as request:
@@ -50,7 +101,7 @@ class AccountTests(unittest.TestCase):
         self.assertIn('认证失败', result[0])
         self.assertIn('未知', result[3])
         self.assertNotIn('积分不足', result[4])
-        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_count, 2)
 
     def test_device_mismatch_is_failure_even_with_success_message(self):
         result, request = self.run_account([{
@@ -58,7 +109,7 @@ class AccountTests(unittest.TestCase):
         }])
         self.assertIn('GLADOS_USER_AGENT', result[0])
         self.assertIn('失败', result[0])
-        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_count, 2)
 
     def test_new_observation_and_existing_checkin_messages(self):
         for payload in (
@@ -72,7 +123,7 @@ class AccountTests(unittest.TestCase):
                 self.assertIn('签到成功', result[0])
                 self.assertEqual(result[1:4], ('12', '23 天', '120 积分'))
                 self.assertIn('积分不足', result[4])
-                self.assertEqual(request.call_count, 3)
+                self.assertEqual(request.call_count, 4)
 
     def test_repeat_is_normal(self):
         result, _ = self.run_account([
@@ -87,7 +138,7 @@ class AccountTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 result, request = self.run_account([payload])
                 self.assertIn('失败', result[0])
-                self.assertEqual(request.call_count, 1)
+                self.assertEqual(request.call_count, 2)
 
     def test_unknown_points_never_exchange_or_claim_zero(self):
         for payload in (None, [], {'code': 0}, {'points': 'NaN'}, {'points': {}}, {'points': True}, {'code': 4, 'points': 999}):
@@ -97,7 +148,7 @@ class AccountTests(unittest.TestCase):
                 ])
                 self.assertIn('获取剩余积分失败', result[3])
                 self.assertIn('余额未知', result[4])
-                self.assertEqual(request.call_count, 3)
+                self.assertEqual(request.call_count, 4)
 
     def test_auth_expires_during_queries(self):
         result, request = self.run_account([
@@ -105,7 +156,7 @@ class AccountTests(unittest.TestCase):
         ])
         self.assertIn('获取剩余天数失败', result[2])
         self.assertIn('未兑换', result[4])
-        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_count, 3)
 
     def test_bad_status_prevents_exchange(self):
         for payload in ({'data': None}, {'data': {'leftDays': 'bad'}}, {'code': 4, 'data': {'leftDays': 10}}):
@@ -113,14 +164,14 @@ class AccountTests(unittest.TestCase):
                 result, request = self.run_account([{'code': 0}, payload, {'points': 500}])
                 self.assertIn('获取剩余天数失败', result[2])
                 self.assertIn('状态查询失败', result[4])
-                self.assertEqual(request.call_count, 3)
+                self.assertEqual(request.call_count, 4)
 
     def test_exchange_runs_once_only_after_valid_balance(self):
         result, request = self.run_account([
             {'code': 0}, {'data': {'leftDays': 10}}, {'points': 500}, {'code': 0}
         ])
         self.assertIn('兑换成功', result[4])
-        self.assertEqual(request.call_count, 4)
+        self.assertEqual(request.call_count, 5)
         self.assertEqual(request.call_args.args[:2], (checkin.EXCHANGE_URL, 'POST'))
         self.assertEqual(request.call_args.args[3], {'planType': 'plan500'})
 
@@ -141,9 +192,10 @@ class AccountTests(unittest.TestCase):
 
 class TransportTests(unittest.TestCase):
     def test_post_uses_json_and_preserves_full_cookie(self):
+        payload = {'token': 'glados.cloud', 'nonce': 'test-challenge', 'proof': 'test-proof'}
         with patch.object(checkin.requests, 'post', return_value=response({'code': 0})) as post:
-            checkin.make_request(checkin.CHECKIN_URL, 'POST', {}, checkin.CHECKIN_DATA, cookies=COOKIE)
-        self.assertEqual(post.call_args.kwargs['json'], {'token': 'glados.cloud'})
+            checkin.make_request(checkin.CHECKIN_URL, 'POST', {}, payload, cookies=COOKIE)
+        self.assertEqual(post.call_args.kwargs['json'], payload)
         self.assertEqual(post.call_args.kwargs['headers']['cookie'], COOKIE)
         self.assertEqual(post.call_args.kwargs['timeout'], checkin.REQUEST_TIMEOUT)
         self.assertFalse(post.call_args.kwargs['allow_redirects'])

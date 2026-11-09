@@ -2,8 +2,10 @@ import requests
 import os
 import logging
 import datetime
+import hashlib
 import math
 import re
+import time
 from email.utils import parsedate_to_datetime
 from http.cookies import CookieError, SimpleCookie
 from typing import Dict, List, Optional, Tuple
@@ -37,12 +39,13 @@ REQUEST_TIMEOUT = 20
 
 # API URLs
 CHECKIN_URL = "https://glados.cloud/api/user/checkin"
+CHECKIN_CHALLENGE_URL = f'{CHECKIN_URL}/challenge'
 STATUS_URL = "https://glados.cloud/api/user/status"
 POINTS_URL = "https://glados.cloud/api/user/points"
 EXCHANGE_URL = "https://glados.cloud/api/user/exchange"
 
-# POST DATA
-CHECKIN_DATA = {"token": "glados.cloud"}
+# The console waits at least 2.5 s. Allow a small timing margin.
+CHECKIN_CHALLENGE_DELAY = 2.7
 
 # Request Headers
 HEADERS_TEMPLATE = {
@@ -57,7 +60,7 @@ EXCHANGE_POINTS = {"plan100": 100, "plan200": 200, "plan500": 500}
 
 SESSION_COOKIE_NAMES = ('gld:sess', 'gld:sess.sig')
 COOKIE_DIAGNOSTIC_LABELS = {
-    CHECKIN_URL: '签到', STATUS_URL: '状态',
+    CHECKIN_CHALLENGE_URL: '签到校验', CHECKIN_URL: '签到', STATUS_URL: '状态',
     POINTS_URL: '积分', EXCHANGE_URL: '兑换',
 }
 
@@ -277,8 +280,37 @@ def checkin_and_process(cookie: str, exchange_plan: str) -> Tuple[str, str, str,
     headers = get_request_headers()
     if not os.environ.get(ENV_USER_AGENT, '').strip():
         logger.warning('GLADOS_USER_AGENT 未设置；设备校验失败时请复制登录浏览器的 User-Agent。')
+
+    # Keep the challenge and the single check-in POST on the same origin.
+    challenge_started = time.monotonic()
+    challenge = read_payload(make_request(CHECKIN_CHALLENGE_URL, 'GET', headers, cookies=cookie), '签到校验')
+    if challenge is None:
+        return '签到失败: 无法获取签到校验', '0', '未知', '未知', '未兑换（签到失败）'
+    auth_error = authentication_error(challenge)
+    if auth_error:
+        return f'签到失败: {auth_error}', '0', '未知（认证未通过）', '未知（认证未通过）', '未兑换（认证未通过）'
+
+    nonce = challenge.get('nonce')
+    ttl_ms = challenge.get('ttl', 300_000)
+    if (
+        type(challenge.get('code')) is not int or challenge['code'] != 0
+        or not isinstance(nonce, str) or not 0 < len(nonce) <= 4096 or not nonce.strip()
+        or type(ttl_ms) not in (int, float)
+        or (isinstance(ttl_ms, float) and not math.isfinite(ttl_ms))
+        or ttl_ms <= CHECKIN_CHALLENGE_DELAY * 1000
+    ):
+        return '签到失败: 签到校验无效或有效期不足', '0', '未知', '未知', '未兑换（签到失败）'
+    try:
+        proof = hashlib.sha256((nonce + '.glados-observe-v1').encode('utf-8')).hexdigest()
+    except UnicodeEncodeError:
+        return '签到失败: 签到校验编码无效', '0', '未知', '未知', '未兑换（签到失败）'
+
+    time.sleep(CHECKIN_CHALLENGE_DELAY)
+    if (time.monotonic() - challenge_started) * 1000 >= ttl_ms:
+        return '签到失败: 签到校验已过期', '0', '未知', '未知', '未兑换（签到失败）'
+
     checkin_data = read_payload(make_request(
-        CHECKIN_URL, 'POST', headers, CHECKIN_DATA, cookies=cookie
+        CHECKIN_URL, 'POST', headers, {'token': 'glados.cloud', 'nonce': nonce, 'proof': proof}, cookies=cookie
     ), '签到')
     if checkin_data is None:
         return '签到失败: 请求或响应解析失败', '0', '未知', '未知', '未兑换（签到失败）'

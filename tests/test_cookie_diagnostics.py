@@ -123,21 +123,25 @@ class CookieDiagnosticTests(unittest.TestCase):
         get.assert_called_once()
         self.assertIn('动作=清除或空值', '\n'.join(captured.output))
 
-    def test_account_uses_same_three_requests_without_applying_new_values(self):
+    def test_account_does_not_apply_new_cookie_values(self):
         post_result = response(['gld:sess=TEST_NEW_SESSION; Max-Age=604800'])
-        get_results = [response(payload={'data': {'leftDays': 10}}),
+        get_results = [response(payload={'code': 0, 'nonce': 'TEST_PRIVATE_NONCE'}),
+                       response(payload={'data': {'leftDays': 10}}),
                        response(payload={'points': 100})]
-        with patch.dict(os.environ, {'GLADOS_USER_AGENT': 'Test browser'}, clear=True):
+        with patch.dict(os.environ, {'GLADOS_USER_AGENT': 'Test browser'}, clear=True), patch.object(checkin.time, 'sleep'):
             with patch.object(checkin.requests, 'post', return_value=post_result) as post:
                 with patch.object(checkin.requests, 'get', side_effect=get_results) as get:
-                    with self.assertLogs(checkin.logger, level='INFO'):
+                    with self.assertLogs(checkin.logger, level='INFO') as captured:
                         result = checkin.checkin_and_process(COOKIE, 'plan500')
         self.assertIn('签到成功', result[0])
         post.assert_called_once()
         self.assertEqual(post.call_args.args, (checkin.CHECKIN_URL,))
-        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_count, 3)
         self.assertEqual([call.args[0] for call in get.call_args_list],
-                         [checkin.STATUS_URL, checkin.POINTS_URL])
+                         [checkin.CHECKIN_CHALLENGE_URL, checkin.STATUS_URL, checkin.POINTS_URL])
+        logs = '\n'.join(captured.output)
+        self.assertNotIn(post.call_args.kwargs['json']['nonce'], logs)
+        self.assertNotIn(post.call_args.kwargs['json']['proof'], logs)
         for call in [post.call_args] + get.call_args_list:
             self.assertEqual(call.kwargs['headers']['cookie'], COOKIE)
             self.assertEqual(call.kwargs['timeout'], checkin.REQUEST_TIMEOUT)
