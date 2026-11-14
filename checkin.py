@@ -43,6 +43,7 @@ CHECKIN_CHALLENGE_URL = f'{CHECKIN_URL}/challenge'
 STATUS_URL = "https://glados.cloud/api/user/status"
 POINTS_URL = "https://glados.cloud/api/user/points"
 EXCHANGE_URL = "https://glados.cloud/api/user/exchange"
+MANUAL_CHECKIN_LINK = '[打开 GLaDOS 官网签到](https://glados.space/console/checkin)'
 
 # The console waits at least 2.5 s. Allow a small timing margin.
 CHECKIN_CHALLENGE_DELAY = 2.7
@@ -84,8 +85,6 @@ def load_config() -> Tuple[str, List[str], str]:
         cookies_list = []
     else:
         cookies_list = [normalize_cookie(cookie) for cookie in raw_cookies_env.split('&') if cookie.strip()]
-        if not cookies_list:
-            raise ValueError(f"环境变量 '{ENV_COOKIES}' 已设置，但未包含任何有效的 Cookie。")
 
     if not exchange_plan_env:
         logger.warning(f"环境变量 '{ENV_EXCHANGE_PLAN}' 未设置，将使用默认兑换计划 'plan500'。")
@@ -412,6 +411,8 @@ def format_push_content(results: List[Dict[str, str]]) -> Tuple[str, str]:
         content_lines.append(line)
 
     content = "\n".join(content_lines)
+    if any(res['status'].startswith('签到失败') for res in results):
+        content += f'\n\n{MANUAL_CHECKIN_LINK}'
     return title, content
 
 
@@ -458,7 +459,8 @@ def main():
 
         if not cookies_list:
             logger.error("未找到有效的 Cookie，退出程序。")
-            title, content = "# 未找到 cookies!", ""
+            title = 'GLaDOS 自动签到未执行'
+            content = f'未找到有效的 Cookie。\n\n{MANUAL_CHECKIN_LINK}'
             exit_code = 1
         else:
             results = []
@@ -480,7 +482,8 @@ def main():
 
     except Exception as e:
         logger.error('主程序执行过程中发生未预期的错误 (%s)。', type(e).__name__)
-        title, content = "# 脚本执行出错", "请检查配置与脚本日志。"
+        title = 'GLaDOS 自动签到运行出错'
+        content = f'请检查配置与脚本日志，也可在官网确认签到状态。\n\n{MANUAL_CHECKIN_LINK}'
         exit_code = 1
 
     if not push_key:

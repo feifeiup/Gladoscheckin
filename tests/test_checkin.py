@@ -201,11 +201,12 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(headers['sec-ch-ua-platform'], '"Windows"')
 
     def test_expired_status_counts_as_failure_in_notification(self):
-        title, _ = checkin.format_push_content([{
+        title, content = checkin.format_push_content([{
             'status': '签到成功', 'points': '12', 'days': '获取剩余天数失败（认证失败）',
             'points_total': '未知（认证未通过）', 'exchange': '未兑换（认证未通过）'
         }])
         self.assertEqual(title, 'GLaDOS 签到, 成功1, 失败1, 重复0')
+        self.assertNotIn('https://glados.space/console/checkin', content)
 
     def test_unrecognized_result_is_not_counted_as_success_in_notification(self):
         title, _ = checkin.format_push_content([{
@@ -270,15 +271,40 @@ class MainTests(unittest.TestCase):
                     self.assertEqual(checkin.main(), 1)
         self.assertEqual(account.call_count, 2)
         push.return_value.send_text.assert_called_once()
+        content = push.return_value.send_text.call_args.kwargs['desp']
+        self.assertIn('签到失败: 认证失败', content)
+        self.assertIn('\n\n[打开 GLaDOS 官网签到](https://glados.space/console/checkin)', content)
 
     def test_success_and_repeat_exit_zero(self):
-        for status in ('签到成功，获得 12 积分', '重复签到，明天再来'):
+        for status, points in (('签到成功，获得 12 积分', '12'), ('重复签到，明天再来', '0')):
             with self.subTest(status=status):
-                with patch.object(checkin, 'load_config', return_value=('', [COOKIE], 'plan500')):
-                    with patch.object(checkin, 'checkin_and_process', return_value=(
-                        status, '0', '10 天', '10 积分', '积分不足，未兑换'
-                    )):
-                        self.assertEqual(checkin.main(), 0)
+                with (
+                    patch.object(checkin, 'load_config', return_value=('test-key', [COOKIE], 'plan500')),
+                    patch.object(checkin, 'checkin_and_process', return_value=(
+                        status, points, '10 天', '200 积分', '积分不足，未兑换'
+                    )),
+                    patch.object(checkin, 'send_notification', return_value=True) as push,
+                ):
+                    self.assertEqual(checkin.main(), 0)
+                push.assert_called_once()
+                content = push.call_args.args[2]
+                self.assertIn(status, content)
+                self.assertIn(f'P:{points}', content)
+                self.assertIn('总积分:200 积分', content)
+                self.assertNotIn('https://glados.space/console/checkin', content)
+
+    def test_missing_cookies_sends_manual_checkin_link_without_attempt(self):
+        for cookies in ('', ' & '):
+            with self.subTest(cookies=cookies):
+                with (
+                    patch.dict(os.environ, {'PUSHDEER_SENDKEY': 'test-key', 'GLADOS_COOKIES': cookies}),
+                    patch.object(checkin, 'checkin_and_process') as account,
+                    patch.object(checkin, 'send_notification', return_value=True) as push,
+                ):
+                    self.assertEqual(checkin.main(), 1)
+                account.assert_not_called()
+                push.assert_called_once()
+                self.assertIn('https://glados.space/console/checkin', push.call_args.args[2])
 
     def test_config_exception_does_not_reference_uninitialized_push_key(self):
         with patch.object(checkin, 'load_config', side_effect=ValueError('private-data')):
