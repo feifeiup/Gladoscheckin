@@ -140,6 +140,24 @@ class AccountTests(unittest.TestCase):
                 self.assertIn('失败', result[0])
                 self.assertEqual(request.call_count, 2)
 
+    def test_unknown_checkin_logs_only_a_bounded_integer_code(self):
+        for code, expected in ((5, '5'), (1000, '未知'), ('private-code', '未知')):
+            with self.subTest(code=code):
+                with self.assertLogs(checkin.logger, level='WARNING') as logs:
+                    result, request = self.run_account([{'code': code, 'message': 'private-message'}])
+                self.assertEqual(logs.records[-1].getMessage(), f'签到接口返回未识别的结果，业务码: {expected}')
+                self.assertIn('签到失败', result[0])
+                self.assertEqual(request.call_count, 2)
+
+    def test_explicit_cloudflare_failure_stops_followup_requests(self):
+        with self.assertLogs(checkin.logger, level='WARNING') as logs:
+            result, request = self.run_account([{
+                'code': 5, 'message': 'Cloudflare verification failed. Nothing was recorded. private-data'
+            }])
+        self.assertIn('签到失败: Cloudflare 验证失败', result[0])
+        self.assertNotIn('private-data', '\n'.join(logs.output))
+        self.assertEqual(request.call_count, 2)
+
     def test_unknown_points_never_exchange_or_claim_zero(self):
         for payload in (None, [], {'code': 0}, {'points': 'NaN'}, {'points': {}}, {'points': True}, {'code': 4, 'points': 999}):
             with self.subTest(payload=payload):
@@ -187,7 +205,14 @@ class AccountTests(unittest.TestCase):
             'status': '签到成功', 'points': '12', 'days': '获取剩余天数失败（认证失败）',
             'points_total': '未知（认证未通过）', 'exchange': '未兑换（认证未通过）'
         }])
-        self.assertIn('失败1', title)
+        self.assertEqual(title, 'GLaDOS 签到, 成功1, 失败1, 重复0')
+
+    def test_unrecognized_result_is_not_counted_as_success_in_notification(self):
+        title, _ = checkin.format_push_content([{
+            'status': '签到失败: 接口未返回可识别的成功结果', 'points': '0', 'days': '未知',
+            'points_total': '未知', 'exchange': '未兑换（签到失败）'
+        }])
+        self.assertEqual(title, 'GLaDOS 签到, 成功0, 失败1, 重复0')
 
 
 class TransportTests(unittest.TestCase):

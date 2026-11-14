@@ -320,6 +320,10 @@ def checkin_and_process(cookie: str, exchange_plan: str) -> Tuple[str, str, str,
 
     message = str(checkin_data.get('message', '')).lower()
     code = checkin_data.get('code')
+    if 'cloudflare verification failed' in message:
+        logger.warning('签到接口明确提示 Cloudflare 验证失败。')
+        return '签到失败: Cloudflare 验证失败，请在官网签到', '0', '未知', '未知', '未兑换（签到失败）'
+
     points_gained = str(numeric_value(checkin_data.get('points')) or 0)
     if 'checkin repeats!' in message and code in (None, 0, 1):
         status_msg, points_gained = '重复签到，明天再来', '0'
@@ -328,6 +332,8 @@ def checkin_and_process(cookie: str, exchange_plan: str) -> Tuple[str, str, str,
     ))):
         status_msg = f'签到成功，获得 {points_gained} 积分'
     else:
+        safe_code = code if type(code) is int and -999 <= code <= 999 else '未知'
+        logger.warning('签到接口返回未识别的结果，业务码: %s', safe_code)
         return '签到失败: 接口未返回可识别的成功结果', '0', '未知', '未知', '未兑换（签到失败）'
 
     status_data = read_payload(make_request(STATUS_URL, 'GET', headers, cookies=cookie), '状态')
@@ -386,7 +392,7 @@ def account_failed(result: Dict[str, str]) -> bool:
 
 def format_push_content(results: List[Dict[str, str]]) -> Tuple[str, str]:
 
-    success_count = sum(1 for r in results if "成功" in r['status'])
+    success_count = sum(1 for r in results if r['status'].startswith('签到成功'))
     fail_count = sum(1 for r in results if account_failed(r))
     repeat_count = sum(1 for r in results if "重复" in r['status'])
 
