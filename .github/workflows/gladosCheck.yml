@@ -1,6 +1,12 @@
 name: Browser check-in trial
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      trial_day:
+        description: 'Beijing date of the approved trial (YYYY-MM-DD)'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -22,5 +28,5 @@ jobs:
       - name: Check the official browser flow once
         env:
           GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
-          GLADOS_TRIAL_DAY: '2026-11-15'
+          GLADOS_TRIAL_DAY: ${{ inputs.trial_day }}
         run: python browser_checkin_trial.py

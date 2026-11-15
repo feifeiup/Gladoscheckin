@@ -2,25 +2,94 @@
 
 import os
 import re
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from http.cookies import SimpleCookie
 from urllib.parse import urlsplit
 
-from playwright.sync_api import TimeoutError, sync_playwright
+from playwright.sync_api import Error, TimeoutError, sync_playwright
 
 
 HOST = 'glados.cloud'
+ALTERNATE_HOST = 'glados.space'
 CONSOLE_URL = f'https://{HOST}/console/checkin'
 SESSION_COOKIES = ('gld:sess', 'gld:sess.sig')
 POINTS = re.compile(r'(?im)^[ \t]*points[ \t]*\n[ \t]*(\d+(?:\.\d+)?)[ \t]*$')
 DAYS_LEFT = re.compile(r'(?mi)^[ \t]*days left[ \t]*\n[ \t]*\d+')
 REWARD = re.compile(r'✓\s*\+(\d+(?:\.\d+)?)')
-CHALLENGE_FRAME = 'iframe[src^="https://challenges.cloudflare.com/"]'
+CLOUDFLARE_HOST = 'challenges.cloudflare.com'
+CHALLENGE_FRAME = f'iframe[src^="https://{CLOUDFLARE_HOST}/"]'
 
 
 class TrialStopped(Exception):
     """A fixed, credential-free message describing why the trial stopped."""
+
+
+def request_category(request):
+    url = urlsplit(request.url)
+    if url.scheme != 'https':
+        return None
+    if url.netloc == CLOUDFLARE_HOST:
+        return 'cloudflare'
+    if url.netloc not in (HOST, ALTERNATE_HOST):
+        return None
+    if request.method == 'POST' and url.path == '/api/user/checkin':
+        return 'checkin-post' if url.netloc == HOST else 'alternate-checkin-post'
+    if request.method == 'GET' and url.path == '/api/user/checkin/challenge':
+        return 'site-challenge'
+    if request.method == 'POST':
+        return 'other-site-post'
+    return None
+
+
+class BrowserDiagnostics:
+    """Observe only event categories. Never emit URLs, headers, bodies or raw errors."""
+
+    def __init__(self, page):
+        self.phase = 'page-load'
+        self.events = {phase: Counter() for phase in ('page-load', 'click-window', 'post-check')}
+        self.click_returned = False
+        page.context.on('request', lambda request: self.record(request, 'sent'))
+        page.context.on('response', lambda response: self.record(response.request, 'http', response.status))
+        page.context.on('requestfinished', lambda request: self.record(request, 'finished'))
+        page.context.on('requestfailed', lambda request: self.record(request, 'failed'))
+        page.on('console', self.record_console)
+        page.on('pageerror', lambda _: self.events[self.phase].update(['page-js-error']))
+
+    def record(self, request, event, status=None):
+        category = request_category(request)
+        if category is not None:
+            label = f'{category}.{event}'
+            if type(status) is int and 100 <= status <= 599:
+                label += f'.{status}'
+            self.events[self.phase][label] += 1
+
+    def record_console(self, message):
+        if message.type in ('error', 'warning') and message.text.lower().startswith('[cloudflare turnstile]'):
+            self.events[self.phase]['turnstile-console-warning-or-error'] += 1
+
+    def timeout_reason(self, verification_prompt):
+        events = self.events['click-window']
+        if events['checkin-post.sent']:
+            if events['checkin-post.failed']:
+                return 'The browser issued the check-in POST and observed a transport failure.'
+            if any(key.startswith('checkin-post.http.') for key in events):
+                return 'The observer saw check-in response headers, but the response wait did not resolve.'
+            return 'The browser issued the check-in POST but observed no response headers.'
+        if events['alternate-checkin-post.sent']:
+            return 'The browser issued a check-in POST to the alternate GLaDOS host outside the primary response filter.'
+        if verification_prompt or events['turnstile-console-warning-or-error']:
+            return 'No known check-in POST was observed. Verification UI or a Turnstile warning/error was observed.'
+        if events['cloudflare.sent']:
+            return 'No known check-in POST was observed. Cloudflare network activity was seen; its outcome is unknown.'
+        return 'No known check-in POST was observed and no post-click Cloudflare signal was seen; cause unknown.'
+
+    def report(self):
+        print(f'Browser diagnostics: click returned={self.click_returned}.', flush=True)
+        for phase, events in self.events.items():
+            counts = ', '.join(f'{key}={count}' for key, count in sorted(events.items()))
+            print(f'Browser diagnostics [{phase}]: {counts or "no matching events"}.', flush=True)
 
 
 def local_day():
@@ -43,7 +112,19 @@ def session_cookies():
 
 
 def visible_verification(page):
-    return page.locator(CHALLENGE_FRAME).first.is_visible()
+    return page.locator(f'{CHALLENGE_FRAME}:visible').count() > 0
+
+
+def verification_prompt(page):
+    try:
+        if visible_verification(page) or 'just a moment' in page.title().lower():
+            return True
+        text = page.locator('body').inner_text(timeout=1500).lower()
+        return any(phrase in text for phrase in (
+            'verify you are human', 'cloudflare verification failed', '请验证您是真人'
+        ))
+    except Error:
+        return None
 
 
 def read_day(page, day):
@@ -65,14 +146,10 @@ def read_day(page, day):
 
 
 def is_checkin_response(response):
-    url = urlsplit(response.url)
-    return (
-        url.scheme == 'https' and url.netloc == HOST and url.path == '/api/user/checkin'
-        and response.request.method == 'POST'
-    )
+    return request_category(response.request) == 'checkin-post'
 
 
-def checkin_once(page, day):
+def checkin_once(page, day, diagnostics):
     page.goto(CONSOLE_URL, wait_until='domcontentloaded', timeout=25000)
     before, entry = read_day(page, day)
     if entry != day:
@@ -83,14 +160,19 @@ def checkin_once(page, day):
     if local_day().isoformat() != os.environ.get('GLADOS_TRIAL_DAY'):
         raise TrialStopped('The allowed trial date changed. No check-in button clicked.')
     print(f'Pre-check: calendar has no check-in; balance={before}.', flush=True)
+    diagnostics.phase = 'click-window'
     try:
         with page.expect_response(is_checkin_response, timeout=20000) as pending:
-            button.click(timeout=5000)
+            try:
+                button.click(timeout=5000)
+            except TimeoutError:
+                raise TrialStopped('The browser could not confirm the check-in button click. No retry.')
+            diagnostics.click_returned = True
         response = pending.value
     except TimeoutError:
-        if visible_verification(page):
-            raise TrialStopped('Cloudflare verification appeared after the check-in click. No interaction with it.')
-        raise TrialStopped('No completed check-in response after the single click. No retry.')
+        prompt = verification_prompt(page)
+        print(f'Browser diagnostics: visible verification signal at timeout={prompt}.', flush=True)
+        raise TrialStopped(f'{diagnostics.timeout_reason(prompt)} No retry.')
 
     print(f'Check-in response HTTP {response.status}.', flush=True)
     if not response.ok:
@@ -114,6 +196,7 @@ def checkin_once(page, day):
     if safe_code not in (0, 1, 'unknown'):
         raise TrialStopped('The service did not accept the check-in.')
 
+    diagnostics.phase = 'post-check'
     page.reload(wait_until='domcontentloaded', timeout=25000)
     after, entry = read_day(page, day)
     reward = REWARD.search(entry)
@@ -135,7 +218,12 @@ def main():
             try:
                 context = browser.new_context()
                 context.add_cookies(cookies)
-                checkin_once(context.new_page(), f'{today.month}/{today.day}')
+                page = context.new_page()
+                diagnostics = BrowserDiagnostics(page)
+                try:
+                    checkin_once(page, f'{today.month}/{today.day}', diagnostics)
+                finally:
+                    diagnostics.report()
             finally:
                 browser.close()
     except TrialStopped as error:
