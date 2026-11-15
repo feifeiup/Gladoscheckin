@@ -158,14 +158,19 @@ def read_payload(response: Optional[requests.Response], label: str) -> Optional[
     return payload
 
 
-def numeric_value(value) -> Optional[int]:
+def nonnegative_number(value) -> Optional[float]:
     if value is None or isinstance(value, bool):
         return None
     try:
         number = float(value)
-        return int(number) if math.isfinite(number) and number >= 0 else None
+        return number if math.isfinite(number) and number >= 0 else None
     except (ValueError, TypeError, OverflowError):
         return None
+
+
+def numeric_value(value) -> Optional[int]:
+    number = nonnegative_number(value)
+    return int(number) if number is not None else None
 
 
 def log_session_cookie_diagnostics(response: requests.Response, sent_cookie: str, label: str) -> None:
@@ -323,17 +328,24 @@ def checkin_and_process(cookie: str, exchange_plan: str) -> Tuple[str, str, str,
         logger.warning('签到接口明确提示 Cloudflare 验证失败。')
         return '签到失败: Cloudflare 验证失败，请在官网签到', '0', '未知', '未知', '未兑换（签到失败）'
 
-    points_gained = str(numeric_value(checkin_data.get('points')) or 0)
-    if 'checkin repeats!' in message and code in (None, 0, 1):
-        status_msg, points_gained = '重复签到，明天再来', '0'
-    elif code == 0 or (code in (None, 1) and any(marker in message for marker in (
-        'checkin! got', "today's observation logged"
-    ))):
-        status_msg = f'签到成功，获得 {points_gained} 积分'
+    awarded = nonnegative_number(checkin_data.get('points'))
+    observation_logged = "today's observation logged" in message
+    known_code = code is None or (type(code) is int and code in (0, 1))
+    safe_code = code if type(code) is int and -999 <= code <= 999 else '未知'
+    # A zero reward alone does not establish that the account already checked in.
+    if known_code and ('checkin repeats!' in message or (code == 1 and observation_logged and awarded == 0)):
+        status_msg, points_gained = '今日已签到（重复提交）', '0'
+    elif known_code and (code == 0 or 'checkin! got' in message or observation_logged):
+        if awarded is not None and awarded > 0 and not observation_logged:
+            points_gained = str(awarded).removesuffix('.0')
+            status_msg = f'签到成功，获得 {points_gained} 积分'
+        else:
+            status_msg = '签到待确认，请查看官网签到记录'
+            points_gained = '0' if awarded == 0 else '未知'
     else:
-        safe_code = code if type(code) is int and -999 <= code <= 999 else '未知'
         logger.warning('签到接口返回未识别的结果，业务码: %s', safe_code)
         return '签到失败: 接口未返回可识别的成功结果', '0', '未知', '未知', '未兑换（签到失败）'
+    logger.info('签到响应分类: 业务码=%s，%s', safe_code, status_msg)
 
     status_data = read_payload(make_request(STATUS_URL, 'GET', headers, cookies=cookie), '状态')
     remaining_days = '获取剩余天数失败（请求或响应异常）'
@@ -393,9 +405,12 @@ def format_push_content(results: List[Dict[str, str]]) -> Tuple[str, str]:
 
     success_count = sum(1 for r in results if r['status'].startswith('签到成功'))
     fail_count = sum(1 for r in results if account_failed(r))
-    repeat_count = sum(1 for r in results if "重复" in r['status'])
+    repeat_count = sum(1 for r in results if r['status'].startswith('今日已签到'))
+    pending_count = sum(1 for r in results if r['status'].startswith('签到待确认'))
 
     title = f'GLaDOS 签到, 成功{success_count}, 失败{fail_count}, 重复{repeat_count}'
+    if pending_count:
+        title += f', 待确认{pending_count}'
 
     content_lines = []
     for i, res in enumerate(results, 1):

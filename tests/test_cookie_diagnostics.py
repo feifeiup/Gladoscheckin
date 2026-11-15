@@ -124,7 +124,7 @@ class CookieDiagnosticTests(unittest.TestCase):
         self.assertIn('动作=清除或空值', '\n'.join(captured.output))
 
     def test_account_does_not_apply_new_cookie_values(self):
-        post_result = response(['gld:sess=TEST_NEW_SESSION; Max-Age=604800'])
+        post_result = response(['gld:sess=TEST_NEW_SESSION; Max-Age=604800'], payload={'code': 0, 'points': 12})
         get_results = [response(payload={'code': 0, 'nonce': 'TEST_PRIVATE_NONCE'}),
                        response(payload={'data': {'leftDays': 10}}),
                        response(payload={'points': 100})]

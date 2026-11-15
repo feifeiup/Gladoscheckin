@@ -111,27 +111,53 @@ class AccountTests(unittest.TestCase):
         self.assertIn('失败', result[0])
         self.assertEqual(request.call_count, 2)
 
-    def test_new_observation_and_existing_checkin_messages(self):
-        for payload in (
-            {'code': 0, 'message': 'Checkin! Got 12 Points', 'points': 12},
-            {'code': 1, 'message': "Today's observation logged. Return tomorrow for more points.", 'points': 12},
+    def test_new_checkin_reports_numeric_rewards(self):
+        for payload, expected in (
+            ({'code': 0, 'message': 'Checkin! Got 12 Points', 'points': 12}, '12'),
+            ({'code': 1, 'message': 'Checkin! Got 12 Points', 'points': 12}, '12'),
+            ({'code': 0, 'points': '0.5'}, '0.5'),
         ):
             with self.subTest(payload=payload):
                 result, request = self.run_account([
                     payload, {'code': 0, 'data': {'leftDays': '23.9'}}, {'points': '120.0'}
                 ])
                 self.assertIn('签到成功', result[0])
-                self.assertEqual(result[1:4], ('12', '23 天', '120 积分'))
+                self.assertEqual(result[1:4], (expected, '23 天', '120 积分'))
                 self.assertIn('积分不足', result[4])
                 self.assertEqual(request.call_count, 4)
 
     def test_repeat_is_normal(self):
-        result, _ = self.run_account([
+        for payload in (
             {'code': 1, 'message': 'Checkin Repeats! Please Try Tomorrow'},
-            {'data': {'leftDays': 10}}, {'points': 0},
-        ])
-        self.assertIn('重复', result[0])
-        self.assertEqual(result[3], '0 积分')
+            {'code': 1, 'message': "Today's observation logged. Return tomorrow for more points.", 'points': 0},
+        ):
+            with self.subTest(payload=payload):
+                result, request = self.run_account([payload, {'data': {'leftDays': 10}}, {'points': 226}])
+                self.assertEqual(result[:4], ('今日已签到（重复提交）', '0', '10 天', '226 积分'))
+                self.assertEqual(request.call_count, 4)
+                title, _ = checkin.format_push_content([dict(zip(
+                    ('status', 'points', 'days', 'points_total', 'exchange'), result
+                ))])
+                self.assertEqual(title, 'GLaDOS 签到, 成功0, 失败0, 重复1')
+
+    def test_ambiguous_acceptance_does_not_count_as_success_or_repeat(self):
+        for payload, expected in (
+            ({'code': 0, 'points': 0, 'message': 'private-message'}, '0'),
+            ({'code': 0}, '未知'),
+            ({'code': 1, 'message': "Today's observation logged.", 'points': True}, '未知'),
+            ({'code': 1, 'message': "Today's observation logged.", 'points': 12}, '未知'),
+        ):
+            with self.subTest(payload=payload):
+                with self.assertLogs(checkin.logger, level='INFO') as logs:
+                    result, request = self.run_account([payload, {'data': {'leftDays': 10}}, {'points': 226}])
+                self.assertEqual(result[:4], ('签到待确认，请查看官网签到记录', expected, '10 天', '226 积分'))
+                self.assertEqual(request.call_count, 4)
+                self.assertIn(f"业务码={payload['code']}，签到待确认", '\n'.join(logs.output))
+                self.assertNotIn('private-message', '\n'.join(logs.output))
+                title, _ = checkin.format_push_content([dict(zip(
+                    ('status', 'points', 'days', 'points_total', 'exchange'), result
+                ))])
+                self.assertEqual(title, 'GLaDOS 签到, 成功0, 失败0, 重复0, 待确认1')
 
     def test_unknown_and_non_object_checkin_do_not_continue(self):
         for payload in ([], None, {'code': 4, 'message': 'Checkin! Got 12'}, {'message': 'unknown'}):
@@ -262,7 +288,7 @@ class MainTests(unittest.TestCase):
     def test_failure_not_hidden_by_successful_push_and_other_account_continues(self):
         results = [
             ('签到失败: 认证失败', '0', '未知', '未知', '未兑换（认证未通过）'),
-            ('重复签到，明天再来', '0', '10 天', '10 积分', '积分不足，未兑换'),
+            ('今日已签到（重复提交）', '0', '10 天', '10 积分', '积分不足，未兑换'),
         ]
         with patch.object(checkin, 'load_config', return_value=('test-key', [COOKIE, COOKIE], 'plan500')):
             with patch.object(checkin, 'checkin_and_process', side_effect=results) as account:
@@ -276,7 +302,7 @@ class MainTests(unittest.TestCase):
         self.assertIn('\n\n[打开 GLaDOS 官网签到](https://glados.space/console/checkin)', content)
 
     def test_success_and_repeat_exit_zero(self):
-        for status, points in (('签到成功，获得 12 积分', '12'), ('重复签到，明天再来', '0')):
+        for status, points in (('签到成功，获得 12 积分', '12'), ('今日已签到（重复提交）', '0')):
             with self.subTest(status=status):
                 with (
                     patch.object(checkin, 'load_config', return_value=('test-key', [COOKIE], 'plan500')),
