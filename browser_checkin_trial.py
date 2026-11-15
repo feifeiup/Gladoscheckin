@@ -11,8 +11,8 @@ from urllib.parse import urlsplit
 from playwright.sync_api import Error, TimeoutError, sync_playwright
 
 
-HOST = 'glados.cloud'
-ALTERNATE_HOST = 'glados.space'
+HOST = 'glados.space'
+ALTERNATE_HOST = 'glados.cloud'
 CONSOLE_URL = f'https://{HOST}/console/checkin'
 SESSION_COOKIES = ('gld:sess', 'gld:sess.sig')
 POINTS = re.compile(r'(?im)^[ \t]*points[ \t]*\n[ \t]*(\d+(?:\.\d+)?)[ \t]*$')
